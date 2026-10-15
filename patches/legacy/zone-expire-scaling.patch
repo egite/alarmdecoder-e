@@ -1,0 +1,27 @@
+diff --git a/alarmdecoder/zonetracking.py b/alarmdecoder/zonetracking.py
+index 47cf38a..a034b2e 100644
+--- a/alarmdecoder/zonetracking.py
++++ b/alarmdecoder/zonetracking.py
+@@ -80,7 +80,13 @@ class Zonetracker(object):
+     on_restore = event.Event("This event is called when the device detects that a fault is restored.\n\n**Callback definition:** *def callback(device, zone)*")
+ 
+     EXPIRE = 30
+-    """Zone expiration timeout."""
++    """Minimum zone expiration timeout, in seconds."""
++
++    EXPIRE_PER_ZONE = 5
++    """Seconds of expiration timeout allowed per faulted zone.  The keypad
++    cycles through faulted zones one at a time, so a zone is only seen again
++    after every other faulted zone has been displayed.  With many zones
++    faulted that cycle can take far longer than EXPIRE."""
+ 
+     @property
+     def zones(self):
+@@ -375,4 +381,6 @@ class Zonetracker(object):
+ 
+         :returns: whether or not the zone is expired
+         """
+-        return (time.time() > self._zones[zone].timestamp + Zonetracker.EXPIRE) and self._zones[zone].expander is False
++        expire = max(Zonetracker.EXPIRE, len(self._zones_faulted) * Zonetracker.EXPIRE_PER_ZONE)
++
++        return (time.time() > self._zones[zone].timestamp + expire) and self._zones[zone].expander is False

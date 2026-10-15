@@ -1,0 +1,168 @@
+diff --git a/ad2web/notifications/forms.py b/ad2web/notifications/forms.py
+index 5cfdf48..0bd145d 100644
+--- a/ad2web/notifications/forms.py
++++ b/ad2web/notifications/forms.py
+@@ -140,6 +140,8 @@ class EmailNotificationInternalForm(Form):
+     authentication_required = BooleanField(u'Authenticate with email server?', default=False)
+     username = TextField(u'Username', [Optional(), Length(max=255)])
+     password = PasswordField(u'Password', [Optional(), Length(max=255)])
++    throttle_count = IntegerField(u'Throttle: Maximum Emails', [Optional(), NumberRange(min=0)], default=0, description=u'Send no more than this many emails per throttle period (0 = no limit). Alarm, panic and fire alerts are always sent.')
++    throttle_minutes = IntegerField(u'Throttle: Period (minutes)', [Optional(), NumberRange(min=0)], default=0, description=u'Length of the throttle period in minutes (0 = no limit)')
+ 
+     def __init__(self, *args, **kwargs):
+         kwargs['csrf_enabled'] = False
+@@ -169,6 +171,8 @@ class EmailNotificationForm(EditNotificationForm):
+         settings['authentication_required'] = self.populate_setting('authentication_required', self.form_field.authentication_required.data)
+         settings['username'] = self.populate_setting('username', self.form_field.username.data)
+         settings['password'] = self.populate_setting('password', self.form_field.password.data)
++        settings['throttle_count'] = self.populate_setting('throttle_count', self.form_field.throttle_count.data or 0)
++        settings['throttle_minutes'] = self.populate_setting('throttle_minutes', self.form_field.throttle_minutes.data or 0)
+ 
+     def populate_from_settings(self, id):
+         EditNotificationForm.populate_from_settings(self, id)
+@@ -184,6 +188,8 @@ class EmailNotificationForm(EditNotificationForm):
+         self.form_field.username.data = self.populate_from_setting(id, 'username')
+         self.form_field.password.widget.hide_value = False
+         self.form_field.password.data = self.populate_from_setting(id, 'password')
++        self.form_field.throttle_count.data = self.populate_from_setting(id, 'throttle_count', default=0)
++        self.form_field.throttle_minutes.data = self.populate_from_setting(id, 'throttle_minutes', default=0)
+ 
+ 
+ class PushoverNotificationInternalForm(Form):
+diff --git a/ad2web/notifications/types.py b/ad2web/notifications/types.py
+index 6d6be62..6e1aaf5 100644
+--- a/ad2web/notifications/types.py
++++ b/ad2web/notifications/types.py
+@@ -17,6 +17,7 @@ import base64
+ import uuid
+ import traceback
+ import functools
++import collections
+ from alarmdecoder import AlarmDecoder
+ from alarmdecoder.panels import ADEMCO, DSC, PANEL_TYPES
+ from alarmdecoder.zonetracking import Zone as ADZone
+@@ -156,6 +157,17 @@ def threaded(func):
+     return wrapper
+ 
+ 
++# Never throttled, so a burst of zone emails can't hide an alarm.
++THROTTLE_EXEMPT_EVENTS = (ALARM, PANIC, FIRE)
++
++
++def _int_setting(obj, name, default=0):
++    try:
++        return int(obj.get_setting(name, default=default) or 0)
++    except (TypeError, ValueError):
++        return default
++
++
+ class NotificationSystem(object):
+     def __init__(self):
+         self._notifiers = {}
+@@ -196,7 +208,7 @@ class NotificationSystem(object):
+ 
+                     if message:
+                         if n.delay > 0 and type in (ZONE_FAULT, ZONE_RESTORE, BYPASS):
+-                            message_send_time = time.mktime((datetime.datetime.combine(datetime.date.today(), datetime.datetime.time(datetime.datetime.now())) + datetime.timedelta(minutes=delay)).timetuple())
++                            message_send_time = time.mktime((datetime.datetime.combine(datetime.date.today(), datetime.datetime.time(datetime.datetime.now())) + datetime.timedelta(minutes=n.delay)).timetuple())
+ 
+                             notify = {}
+                             notify['notification'] = n
+@@ -785,8 +797,54 @@ class EmailNotification(BaseNotification):
+         self.password = obj.get_setting('password')
+         self.suppress_timestamp = obj.get_setting('suppress_timestamp',default=False)
+ 
++        # Throttle: send at most throttle_count emails per throttle_minutes.
++        # Either value at 0 disables throttling.
++        self.throttle_count = _int_setting(obj, 'throttle_count')
++        self.throttle_minutes = _int_setting(obj, 'throttle_minutes')
++        self._throttle_lock = threading.Lock()
++        self._throttle_sent = collections.deque()
++        self._throttle_dropped = 0
++
++    def _throttle(self, type):
++        """
++        Returns (allowed, dropped) where dropped is the number of messages
++        discarded since the last one that was allowed through.
++        """
++        # Test messages and life-safety events are never held back, but they
++        # still count toward the limit.
++        exempt = type is None or type in THROTTLE_EXEMPT_EVENTS
++
++        if self.throttle_count <= 0 or self.throttle_minutes <= 0:
++            return True, 0
++
++        with self._throttle_lock:
++            now = time.time()
++            window_start = now - self.throttle_minutes * 60
++            while self._throttle_sent and self._throttle_sent[0] <= window_start:
++                self._throttle_sent.popleft()
++
++            if not exempt and len(self._throttle_sent) >= self.throttle_count:
++                self._throttle_dropped += 1
++                return False, self._throttle_dropped
++
++            self._throttle_sent.append(now)
++            dropped = self._throttle_dropped
++            self._throttle_dropped = 0
++
++            return True, dropped
++
+     def send(self, type, text, raw):
+         if check_time_restriction(self.starttime, self.endtime):
++            allowed, dropped = self._throttle(type)
++            if not allowed:
++                current_app.logger.info('Email notification "{0}" throttled ({1} per {2} min), {3} dropped so far.'.format(
++                    self.description, self.throttle_count, self.throttle_minutes, dropped))
++                return
++
++            if dropped:
++                text = text + "\n\n({0} earlier alert(s) were not emailed because of the throttle limit of {1} per {2} minute(s).)".format(
++                    dropped, self.throttle_count, self.throttle_minutes)
++
+             msg = MIMEText(text)
+ 
+             if self.suppress_timestamp == False:
+diff --git a/ad2web/updater/models.py b/ad2web/updater/models.py
+index decea94..5882910 100644
+--- a/ad2web/updater/models.py
++++ b/ad2web/updater/models.py
+@@ -18,6 +18,9 @@ from alarmdecoder.util import Firmware
+ 
+ from .constants import FIRMWARE_JSON_URL
+ 
++# Shown in the page footer.  Locally modified build, hence -E.
++WEBAPP_VERSION = '0.8.6-E'
++
+ try:
+     current_app._get_current_object()
+     running_in_context = True
+@@ -178,14 +181,7 @@ class WebappUpdater(object):
+ 
+     @property
+     def version(self):
+-        version = ''
+-
+-        try:
+-            version = sh.git('describe', tags=True, always=True, long=True)
+-        except:
+-            pass
+-
+-        return version.strip()
++        return WEBAPP_VERSION
+ 
+     def refresh(self):
+         """
+diff --git a/setup.py b/setup.py
+index d157eb4..3f76552 100644
+--- a/setup.py
++++ b/setup.py
+@@ -4,7 +4,7 @@ from setuptools import setup
+ 
+ setup(
+     name="alarmdecoder-webapp",
+-    version='0.8.6',
++    version='0.8.6-E',
+     url='https://github.com/nutechsoftware/alarmdecoder-webapp',
+     description='AlarmDecoder-webapp provides a web interface for your AlarmDecoder device.',
+     author='Nu Tech Software Solutions, Inc.',
